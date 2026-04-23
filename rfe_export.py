@@ -33,16 +33,12 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-try:
-    import asyncio
-    from notebooklm import NotebookLMClient
-    NOTEBOOKLM_AVAILABLE = True
-except ImportError:
-    NOTEBOOKLM_AVAILABLE = False
+from jira_auth import is_jira_cloud_url, jira_api_token_from_env  # noqa: E402
+from notebooklm_upload import notebooklm_upload_available, upload_csvs_to_notebook  # noqa: E402
 
 DEFAULT_STATE_FILE = Path(__file__).parent / ".rfe_export_last_run"
 DEFAULT_JIRA_URL = "https://issues.redhat.com"
-DEFAULT_NOTEBOOK_NAME = "ACS RICE Scoring and Prioritization Framework"
+DEFAULT_NOTEBOOK_NAME = "The Big Notebook for RHACS Product Management"
 
 RH_SSO_TOKEN_URL = "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token"
 RH_HYDRA_CASE_URL = "https://access.redhat.com/hydra/rest/cases"
@@ -273,26 +269,30 @@ def run_export(
     all_rfes: bool,
     output_path: Optional[Path],
     rh_access_token: Optional[str] = None,
+    jira_email: Optional[str] = None,
 ) -> Path:
     """Export RHACS RFEs to CSV. Returns path to created CSV."""
     session = requests.Session()
     session.headers.update({
-        "Authorization": f"Bearer {api_token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     })
+    if is_jira_cloud_url(jira_url) and jira_email:
+        session.auth = (jira_email, api_token)
+    else:
+        session.headers["Authorization"] = f"Bearer {api_token}"
 
-    api_version = "2"
-    for v in ("2", "3"):
-        try:
-            r = session.get(f"{jira_url}/rest/api/{v}/serverInfo", timeout=10)
-            if r.status_code == 200:
-                api_version = v
-                break
-        except Exception:
-            continue
+    is_cloud = is_jira_cloud_url(jira_url)
+    api_version = "3" if is_cloud else "2"
 
-    print(f"Connected to Jira (API v{api_version})")
+    try:
+        r = session.get(f"{jira_url}/rest/api/{api_version}/serverInfo", timeout=10)
+        if r.status_code == 200:
+            print(f"Connected to Jira (API v{api_version})")
+        else:
+            print(f"Connected to Jira (API v{api_version}, serverInfo returned {r.status_code})")
+    except Exception:
+        print(f"Connected to Jira (API v{api_version})")
 
     component_list = ", ".join(f'"{c}"' for c in RHACS_COMPONENTS)
     component_filter = f"component in ({component_list})"
@@ -326,35 +326,51 @@ def run_export(
     fields_param = ",".join(FIELD_IDS)
 
     all_issues = []
-    start_at = 0
     max_results = 50
 
-    while True:
-        resp = session.get(
-            f"{jira_url}/rest/api/{api_version}/search",
-            params={
+    if is_cloud:
+        search_url = f"{jira_url}/rest/api/3/search/jql"
+        next_token = None
+        while True:
+            params: dict = {
                 "jql": jql,
-                "startAt": start_at,
                 "maxResults": max_results,
                 "fields": fields_param,
-            },
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            print(f"Jira search failed: {resp.status_code}")
-            print(resp.text[:500])
-            sys.exit(1)
-
-        data = resp.json()
-        issues = data.get("issues", [])
-        all_issues.extend(issues)
-
-        total = data.get("total", 0)
-        print(f"  Fetched {len(all_issues)}/{total} RFEs...", end="\r")
-
-        if len(issues) < max_results:
-            break
-        start_at += max_results
+            }
+            if next_token:
+                params["nextPageToken"] = next_token
+            resp = session.get(search_url, params=params, timeout=60)
+            if resp.status_code != 200:
+                print(f"Jira search failed: {resp.status_code}")
+                print(resp.text[:500])
+                sys.exit(1)
+            data = resp.json()
+            all_issues.extend(data.get("issues", []))
+            print(f"  Fetched {len(all_issues)} RFEs...", end="\r")
+            if data.get("isLast", True):
+                break
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+    else:
+        search_url = f"{jira_url}/rest/api/{api_version}/search"
+        start_at = 0
+        while True:
+            resp = session.get(search_url, params={
+                "jql": jql, "startAt": start_at,
+                "maxResults": max_results, "fields": fields_param,
+            }, timeout=60)
+            if resp.status_code != 200:
+                print(f"Jira search failed: {resp.status_code}")
+                print(resp.text[:500])
+                sys.exit(1)
+            data = resp.json()
+            issues = data.get("issues", [])
+            all_issues.extend(issues)
+            print(f"  Fetched {len(all_issues)}/{data.get('total', '?')} RFEs...", end="\r")
+            if len(issues) < max_results:
+                break
+            start_at += max_results
 
     print(f"Retrieved {len(all_issues)} RHACS RFEs       ")
 
@@ -447,35 +463,6 @@ def run_export(
     return output_path
 
 
-async def upload_to_notebooklm(csv_path: Path, notebook_name: str) -> bool:
-    """Upload CSV file to NotebookLM. Returns True on success."""
-    if not NOTEBOOKLM_AVAILABLE:
-        print("notebooklm-py not installed. Run: pip install 'notebooklm-py[browser]'")
-        return False
-
-    try:
-        async with await NotebookLMClient.from_storage() as client:
-            notebooks = await client.notebooks.list()
-            nb = None
-            for n in notebooks:
-                if n.title == notebook_name:
-                    nb = n
-                    break
-            if nb is None:
-                nb = await client.notebooks.create(notebook_name)
-                print(f"Created NotebookLM notebook: {notebook_name}")
-            else:
-                print(f"Using existing NotebookLM notebook: {notebook_name}")
-
-            await client.sources.add_file(nb.id, str(csv_path), wait=True)
-            print(f"Uploaded {csv_path.name} to NotebookLM")
-            return True
-    except Exception as e:
-        print(f"NotebookLM upload failed: {e}")
-        print("   Ensure you have run 'notebooklm login' first")
-        return False
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Export RHACS Feature Requests (RFE) to CSV and upload to NotebookLM",
@@ -504,12 +491,13 @@ def main():
     )
     args = parser.parse_args()
 
-    token = os.getenv("JIRA_TOKEN")
+    token = jira_api_token_from_env()
     if not token:
-        print("JIRA_TOKEN environment variable not set")
-        print("Get a token from: https://issues.redhat.com/secure/ViewProfile.jspa"
-              "?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens")
+        print("JIRA_TOKEN or JIRA_API_TOKEN environment variable not set")
         sys.exit(1)
+
+    jira_url = os.getenv("JIRA_BASE_URL", DEFAULT_JIRA_URL)
+    jira_email = os.getenv("JIRA_EMAIL", "")
 
     rh_access_token = None
     rh_offline_token = os.getenv("RH_OFFLINE_TOKEN", "").strip()
@@ -521,25 +509,27 @@ def main():
         print("RH_OFFLINE_TOKEN not set - SFDC account names will not be resolved")
 
     csv_path = run_export(
-        jira_url=DEFAULT_JIRA_URL,
+        jira_url=jira_url,
         api_token=token,
         state_file=DEFAULT_STATE_FILE,
         force_all=args.force_all,
         all_rfes=args.all_rfes,
         output_path=args.output,
         rh_access_token=rh_access_token,
+        jira_email=jira_email,
     )
 
     if not args.force_all and not args.all_rfes:
         save_last_run(DEFAULT_STATE_FILE, datetime.now().isoformat())
 
     if not args.skip_upload:
-        if NOTEBOOKLM_AVAILABLE:
-            success = asyncio.run(upload_to_notebooklm(csv_path, args.notebook_name))
-            if not success:
-                sys.exit(1)
-        else:
-            print("Install notebooklm-py for upload: pip install 'notebooklm-py[browser]'")
+        if not notebooklm_upload_available():
+            print(
+                "NotebookLM upload unavailable: install notebooklm-mcp-cli and run `nlm login`, "
+                "or pip install 'notebooklm-py[browser]' and run `notebooklm login`"
+            )
+            sys.exit(1)
+        if not upload_csvs_to_notebook([csv_path], args.notebook_name):
             sys.exit(1)
     else:
         print("Skipping NotebookLM upload (--skip-upload)")
