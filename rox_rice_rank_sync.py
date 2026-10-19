@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -704,19 +705,30 @@ def cohort_label_for_version(target_version: str) -> str:
     return target_version.strip()
 
 
-def build_cohort_jql(project_key: str, target_version: str, cohort: str) -> str:
+def build_cohort_jql(
+    project_key: str,
+    target_version: str,
+    cohort: str,
+    issue_types: Optional[List[str]] = None,
+) -> str:
     """
     JQL for the backlog cohort.
 
     ``target-version`` (default): ``Target Version`` field only.
-
     ``both``: Target Version OR matching ``labels`` value.
+
+    *issue_types* defaults to ``["feature"]``; pass ``["feature", "initiative"]``
+    to include both.
     """
     tv = target_version.strip()
     label = cohort_label_for_version(tv)
-    base = (
-        f'project = {project_key} AND type = feature AND statusCategory != Done'
-    )
+    types = issue_types if issue_types else ["feature"]
+    if len(types) == 1:
+        type_clause = f"type = {types[0]}"
+    else:
+        quoted = ", ".join(f'"{t}"' for t in types)
+        type_clause = f"type in ({quoted})"
+    base = f"project = {project_key} AND {type_clause} AND statusCategory != Done"
     mode = (cohort or DEFAULT_COHORT).strip().lower()
     if mode == "target-version":
         return f'{base} AND "Target Version" = "{tv}"'
@@ -1142,15 +1154,19 @@ def update_state_from_features(
 # Matches both old format (rice-rank-NN_YYYYMMDD) and new format (rice::rank-NN_YYYYMMDD)
 # so that old labels are cleaned up automatically on the first run after migration.
 RANK_LABEL_RE = re.compile(r"^rice(?:-rank-|::rank-)\d+_\d{8}$")
-TV_LABEL_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
-# rice:: reach-tier labels → canonical Reach value.
+PROJECT_ALIGNED_LABEL = "project::aligned"
+# Jira issue type names that count as "Project items" for alignment labeling.
+PROJECT_ITEM_TYPES = {"Project"}
+
+# reach:: reach-tier labels → canonical Reach value.
 # Source of truth: RHACS RICE scoring rubric table.
+# Note: these labels intentionally use the reach:: prefix (not rice::).
 REACH_LABEL_MAP: Dict[str, float] = {
-    "rice::renewal-blocker": 48.0,      # Hard customer commitment / regulatory mandate
-    "rice::strategic-initiative": 40.0,  # OKR / cross-team dependency
-    "rice::field-signal": 32.0,          # Strong field signal / competitive differentiator
-    "rice::competitor-parity": 24.0,     # Multiple escalations / win-loss mentions
+    "reach::renewal-blocker": 48.0,      # Hard customer commitment / regulatory mandate
+    "reach::strategic-initiative": 40.0,  # OKR / cross-team dependency
+    "reach::field-signal": 32.0,          # Strong field signal / competitive differentiator
+    "reach::competitor-parity": 24.0,     # Multiple escalations / win-loss mentions
 }
 
 
@@ -1186,6 +1202,7 @@ def post_jira_comment(
 
 
 PROXY_CONFIDENCE_CAP = 0.60
+EFFORT_SPLIT_THRESHOLD = 8.0
 
 
 def enforce_reach_labels(
@@ -1198,6 +1215,7 @@ def enforce_reach_labels(
     reach_field: str,
     do_apply: bool,
     pm_field: str,
+    violations_map: Optional[Dict[str, List[str]]] = None,
 ) -> int:
     """Enforce Reach field value based on rice:: reach-tier labels.
 
@@ -1263,32 +1281,13 @@ def enforce_reach_labels(
 
         reach_by_key[key] = expected_reach
 
-        assignee = fields.get("assignee") or {}
-        pm = fields.get(pm_field) or {}
-        assignee_id = assignee.get("accountId", "")
-        assignee_name = assignee.get("displayName", "assignee")
-        pm_id = pm.get("accountId", "")
-        pm_name = pm.get("displayName", "product manager")
-
-        inline: List[dict] = []
-        if assignee_id:
-            inline.append(_adf_mention(assignee_id, assignee_name))
-        if pm_id and pm_id != assignee_id:
-            if inline:
-                inline.append(_adf_text(" "))
-            inline.append(_adf_mention(pm_id, pm_name))
-        elif not assignee_id and pm_id:
-            inline.append(_adf_mention(pm_id, pm_name))
-        inline.append(_adf_text(
-            f" the Reach score has been automatically corrected from {current_str} to"
-            f" {expected_reach} based on the label '{label_str}'."
-            f" Per the RHACS RICE rubric, '{label_str}' sets Reach = {expected_reach}."
-            f" If this label is incorrect for this feature, please update it."
-            f" Note: recalculate the RICE Score field if it does not update automatically."
-        ))
-        if inline:
-            body = _adf_doc(_adf_para(*inline))
-            post_jira_comment(session, jira_url, api_version, key, body)
+        if violations_map is not None:
+            violations_map.setdefault(key, []).append(
+                f"Reach auto-corrected to {expected_reach}: the label '{label_str}' requires"
+                f" Reach = {expected_reach} per the RHACS RICE rubric. The Reach field has been"
+                f" updated automatically. If this label is incorrect, please update it."
+                f" Note: recalculate the RICE Score field if it does not update automatically."
+            )
 
     if not any_label_found:
         print("   ℹ️  No features have rice:: reach-tier labels")
@@ -1300,6 +1299,11 @@ def enforce_reach_labels(
     return enforced
 
 
+def _violations_hash(messages: List[str]) -> str:
+    combined = "\n".join(sorted(messages))
+    return hashlib.sha1(combined.encode()).hexdigest()[:16]
+
+
 def validate_data_quality(
     session: requests.Session,
     jira_url: str,
@@ -1308,99 +1312,43 @@ def validate_data_quality(
     rice_by_key: Dict[str, Optional[float]],
     labels_by_key: Dict[str, List[str]],
     target_version: str,
-    do_comment: bool,
     confidence_by_key: Optional[Dict[str, Optional[float]]] = None,
     reach_method_by_key: Optional[Dict[str, Optional[str]]] = None,
-    discovery_notified: Optional[Dict[str, bool]] = None,
-) -> Tuple[int, int, int]:
-    """Validate RICE Score presence, TV label correctness, and Proxy-Based Confidence cap.
+    effort_by_key: Optional[Dict[str, Optional[float]]] = None,
+    violations_map: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[int, int, int, int, int]:
+    """Validate RICE Score presence, Proxy-Based Confidence cap, discovery candidates,
+    oversized effort, and rice::discovery label scope.
 
-    Posts a Jira comment mentioning the assignee (or PM) for each violation when
-    *do_comment* is True.  Returns (rice_violations, tv_violations, proxy_conf_violations).
+    Appends violation messages to *violations_map* (keyed by issue key) instead of
+    posting comments directly.  Returns (rice_violations, proxy_conf_violations,
+    discovery_violations, effort_violations, discovery_label_violations).
     """
     rice_violations: List[str] = []
-    tv_violations: List[str] = []
     proxy_conf_violations: List[str] = []
     discovery_violations: List[str] = []
-    commented: List[str] = []
+    effort_violations: List[str] = []
+    discovery_label_violations: List[str] = []
 
     for issue in features:
         key = issue.get("key") or ""
         fields = issue.get("fields") or {}
 
-        # Resolve who to mention: prefer assignee, fall back to Product Manager
-        assignee = fields.get("assignee") or {}
-        pm = fields.get("customfield_10469") or {}
-        contact = assignee if assignee.get("accountId") else pm
-        account_id = contact.get("accountId", "")
-        display_name = contact.get("displayName", "assignee")
-
         rice = rice_by_key.get(key)
         labels = labels_by_key.get(key, [])
-        tv_labels = [lb for lb in labels if TV_LABEL_RE.match(lb)]
 
         # --- Validation 1: RICE Score ---
         if rice is None:
             rice_violations.append(key)
-            if do_comment and account_id:
-                body = _adf_doc(
-                    _adf_para(
-                        _adf_mention(account_id, display_name),
-                        _adf_text(
-                            f" this feature is missing a RICE Score"
-                            f" (Reach × Impact × Confidence / Effort)."
-                            f" Without a score it will be placed at the bottom of the"
-                            f" {target_version} backlog and cannot be ranked automatically."
-                            f" Please fill in all four RICE components."
-                        ),
-                    )
+            if violations_map is not None:
+                violations_map.setdefault(key, []).append(
+                    f"Missing RICE Score: this feature has no RICE Score"
+                    f" (Reach × Impact × Confidence / Effort). Without a score it will be"
+                    f" placed at the bottom of the {target_version} backlog."
+                    f" Please fill in all four RICE components."
                 )
-                if post_jira_comment(session, jira_url, api_version, key, body):
-                    commented.append(key)
-                else:
-                    print(f"   ⚠️  Comment failed for {key} (RICE)")
 
-        # --- Validation 2: TV label ---
-        # Exactly one version-like label, and it must match target_version.
-        if len(tv_labels) == 0:
-            tv_violations.append(key)
-            if do_comment and account_id:
-                body = _adf_doc(
-                    _adf_para(
-                        _adf_mention(account_id, display_name),
-                        _adf_text(
-                            f' this feature has no release label.'
-                            f' Please add label "{target_version}" to match its Target Version.'
-                        ),
-                    )
-                )
-                if post_jira_comment(session, jira_url, api_version, key, body):
-                    commented.append(key)
-                else:
-                    print(f"   ⚠️  Comment failed for {key} (TV label missing)")
-        elif target_version not in tv_labels or len(tv_labels) > 1:
-            tv_violations.append(key)
-            if do_comment and account_id:
-                if target_version not in tv_labels:
-                    msg = (
-                        f' this feature has release label(s) {tv_labels} but its'
-                        f' Target Version is "{target_version}".'
-                        f' Please replace the label(s) with "{target_version}".'
-                    )
-                else:
-                    extra = [lb for lb in tv_labels if lb != target_version]
-                    msg = (
-                        f' this feature has multiple release labels: {tv_labels}.'
-                        f' There should be exactly one label matching the Target Version'
-                        f' ("{target_version}"). Please remove: {extra}.'
-                    )
-                body = _adf_doc(_adf_para(_adf_mention(account_id, display_name), _adf_text(msg)))
-                if post_jira_comment(session, jira_url, api_version, key, body):
-                    commented.append(key)
-                else:
-                    print(f"   ⚠️  Comment failed for {key} (TV label mismatch)")
-
-        # --- Validation 3: Proxy-Based Reach with Confidence > 60% ---
+        # --- Validation 2: Proxy-Based Reach with Confidence > 60% ---
         if reach_method_by_key is not None and confidence_by_key is not None:
             reach_method = reach_method_by_key.get(key)
             conf = confidence_by_key.get(key)
@@ -1411,77 +1359,55 @@ def validate_data_quality(
                 and conf > PROXY_CONFIDENCE_CAP
             ):
                 proxy_conf_violations.append(key)
-                if do_comment:
-                    assignee_id = assignee.get("accountId", "")
-                    assignee_name = assignee.get("displayName", "assignee")
-                    pm_id = pm.get("accountId", "")
-                    pm_name = pm.get("displayName", "product manager")
+                if violations_map is not None:
                     conf_str = f"{round(conf * 100)}%"
-                    inline: List[dict] = []
-                    if assignee_id:
-                        inline.append(_adf_mention(assignee_id, assignee_name))
-                    if pm_id and pm_id != assignee_id:
-                        if inline:
-                            inline.append(_adf_text(" "))
-                        inline.append(_adf_mention(pm_id, pm_name))
-                    inline.append(_adf_text(
-                        f" this feature uses Proxy-Based Reach but has Confidence set to"
-                        f" {conf_str}. Per the RHACS RICE scoring rubric, Proxy-Based Reach"
-                        f" requires Confidence ≤ 60% (50% Low) because there is no telemetry"
-                        f" to validate the estimate — uncertainty must be expressed through"
-                        f" Confidence, not inflated with unsupported assumptions."
-                        f" Please lower Confidence to '50% (Low)', or switch to ARR-Based"
-                        f" or Footprint-Based Reach if you have supporting data."
-                    ))
-                    if inline:
-                        body = _adf_doc(_adf_para(*inline))
-                        if post_jira_comment(session, jira_url, api_version, key, body):
-                            if key not in commented:
-                                commented.append(key)
-                        else:
-                            print(f"   ⚠️  Comment failed for {key} (Proxy+Confidence)")
+                    violations_map.setdefault(key, []).append(
+                        f"Proxy-Based Reach with Confidence {conf_str}: Proxy-Based Reach"
+                        f" requires Confidence ≤ 60% because there is no telemetry to"
+                        f" validate the estimate. Please lower Confidence to '50% (Low)',"
+                        f" or switch to ARR-Based or Footprint-Based Reach if you have data."
+                    )
 
         # --- Validation 4: Confidence = 50% (Low) → discovery candidate ---
-        # Comment fires once per feature; suppressed on repeat runs until confidence changes.
         if confidence_by_key is not None:
             conf = confidence_by_key.get(key)
             if conf is not None and abs(conf - 0.5) < 0.01:
                 discovery_violations.append(key)
-                already_notified = (
-                    discovery_notified is not None and discovery_notified.get(key, False)
-                )
-                if do_comment and not already_notified:
-                    assignee_id = assignee.get("accountId", "")
-                    assignee_name = assignee.get("displayName", "assignee")
-                    pm_id = pm.get("accountId", "")
-                    pm_name = pm.get("displayName", "product manager")
-                    inline2: List[dict] = []
-                    if assignee_id:
-                        inline2.append(_adf_mention(assignee_id, assignee_name))
-                    if pm_id and pm_id != assignee_id:
-                        if inline2:
-                            inline2.append(_adf_text(" "))
-                        inline2.append(_adf_mention(pm_id, pm_name))
-                    elif not assignee_id and pm_id:
-                        inline2.append(_adf_mention(pm_id, pm_name))
-                    inline2.append(_adf_text(
-                        f" this feature has Confidence set to 50% (Low), which signals"
-                        f" significant uncertainty — the team does not yet have enough"
-                        f" information to confidently commit this to the {target_version}"
-                        f" backlog. Please consider treating this as a *discovery item*:"
-                        f" validate the problem with customers, gather supporting data or"
-                        f" telemetry, and refine scope before scheduling. If you have"
-                        f" evidence that supports higher confidence, update the score and"
-                        f" document the rationale."
-                    ))
-                    body = _adf_doc(_adf_para(*inline2))
-                    if post_jira_comment(session, jira_url, api_version, key, body):
-                        if key not in commented:
-                            commented.append(key)
-                        if discovery_notified is not None:
-                            discovery_notified[key] = True
-                    else:
-                        print(f"   ⚠️  Comment failed for {key} (discovery flag)")
+                if violations_map is not None:
+                    violations_map.setdefault(key, []).append(
+                        f"Low confidence (50%): this feature has Confidence set to 50% (Low),"
+                        f" signaling significant uncertainty. Validate the problem with customers"
+                        f" and gather data before committing to {target_version}. If evidence"
+                        f" supports higher confidence, update the score and document the rationale."
+                    )
+
+        # --- Validation 5: Effort > 8 → split recommendation ---
+        if effort_by_key is not None:
+            effort = effort_by_key.get(key)
+            if effort is not None and effort > EFFORT_SPLIT_THRESHOLD:
+                effort_violations.append(key)
+                if violations_map is not None:
+                    violations_map.setdefault(key, []).append(
+                        f"Effort too large ({effort}): Effort exceeds the recommended maximum"
+                        f" of {int(EFFORT_SPLIT_THRESHOLD)} for a single feature in one release."
+                        f" Please either (1) reduce scope to ≤ {int(EFFORT_SPLIT_THRESHOLD)}"
+                        f" points for {target_version}, or (2) split into 2+ smaller features"
+                        f" across the next 3 releases."
+                    )
+
+        # --- Validation 6: rice::discovery label + Effort > 2 sprints ---
+        if "rice::discovery" in labels and effort_by_key is not None:
+            effort = effort_by_key.get(key)
+            if effort is not None and effort > 2:
+                discovery_label_violations.append(key)
+                if violations_map is not None:
+                    violations_map.setdefault(key, []).append(
+                        f"Discovery scope too large ({effort} sprints): features with the"
+                        f" 'rice::discovery' label are limited to 2 sprints. Please reduce"
+                        f" scope to ≤ 2 effort points for {target_version}, or promote this"
+                        f" to a committed feature with Confidence ≥ 75% if you have enough"
+                        f" evidence."
+                    )
 
     # --- Summary ---
     print(f"\n🔍 Data quality ({target_version} cohort):")
@@ -1489,10 +1415,6 @@ def validate_data_quality(
         print(f"   ❌ Missing RICE Score ({len(rice_violations)}): {', '.join(rice_violations)}")
     else:
         print("   ✅ All features have a RICE Score")
-    if tv_violations:
-        print(f"   ❌ TV label issues ({len(tv_violations)}): {', '.join(tv_violations)}")
-    else:
-        print(f'   ✅ All features have exactly one "{target_version}" label')
     if reach_method_by_key is not None and confidence_by_key is not None:
         if proxy_conf_violations:
             print(
@@ -1509,12 +1431,26 @@ def validate_data_quality(
             )
         else:
             print("   ✅ No features flagged as discovery candidates")
-    if do_comment and commented:
-        print(f"   💬 Jira comments posted on {len(commented)} issue(s): {', '.join(commented)}")
-    elif not do_comment and (rice_violations or tv_violations or proxy_conf_violations or discovery_violations):
-        print("   💡 Run with --apply to post Jira comments to assignees")
+    if effort_by_key is not None:
+        if effort_violations:
+            print(
+                f"   ⚠️  Effort > {int(EFFORT_SPLIT_THRESHOLD)} — split recommended"
+                f" ({len(effort_violations)}): {', '.join(effort_violations)}"
+            )
+        else:
+            print(f"   ✅ All features have Effort ≤ {int(EFFORT_SPLIT_THRESHOLD)}")
+        if discovery_label_violations:
+            print(
+                f"   ❌ rice::discovery features with Effort > 2"
+                f" ({len(discovery_label_violations)}): {', '.join(discovery_label_violations)}"
+            )
+        else:
+            print("   ✅ All rice::discovery features have Effort ≤ 2 sprints")
 
-    return len(rice_violations), len(tv_violations), len(proxy_conf_violations), len(discovery_violations)
+    return (
+        len(rice_violations), len(proxy_conf_violations),
+        len(discovery_violations), len(effort_violations), len(discovery_label_violations),
+    )
 
 
 def _get_in_progress_transition_id(
@@ -1632,21 +1568,20 @@ def validate_status_gates(
     features: List[dict],
     rice_by_key: Dict[str, Optional[float]],
     target_version: str,
-    do_comment: bool,
     pm_field: str,
+    violations_map: Optional[Dict[str, List[str]]] = None,
 ) -> int:
     """Check that each feature's status is consistent with its workflow gate requirements.
 
     Gate rules (from the feature workflow):
-    - New in a version cohort: should be moved to Backlog (already in scope).
+    - New in a version cohort: console-only flag, not added to violations_map.
     - ToDo: must have RICE score AND an engineering Assignee.
     - In Progress / In Review / Release Pending: same requirements.
 
-    Posts one consolidated Jira comment per violating feature (mentioning assignee
-    and PM) when *do_comment* is True.  Returns the total number of violations.
+    Appends violation messages to *violations_map* for commentable gates.
+    Returns the total number of violations.
     """
     violations_by_key: Dict[str, List[str]] = {}
-    commented: List[str] = []
 
     for issue in features:
         key = (issue.get("key") or "").strip()
@@ -1690,34 +1625,10 @@ def validate_status_gates(
 
         violations_by_key[key] = msgs
 
-        if do_comment and gates.get("comment", True):
-            pm = fields.get(pm_field) or {}
-            assignee_id = assignee.get("accountId", "")
-            assignee_name = assignee.get("displayName", "assignee")
-            pm_id = pm.get("accountId", "")
-            pm_name = pm.get("displayName", "product manager")
-
-            paragraphs: List[dict] = []
-            for i, msg in enumerate(msgs):
-                inline: List[dict] = []
-                if i == 0:
-                    if assignee_id:
-                        inline.append(_adf_mention(assignee_id, assignee_name))
-                    if pm_id and pm_id != assignee_id:
-                        if inline:
-                            inline.append(_adf_text(" "))
-                        inline.append(_adf_mention(pm_id, pm_name))
-                    elif not assignee_id and pm_id:
-                        inline.append(_adf_mention(pm_id, pm_name))
-                inline.append(_adf_text(msg))
-                paragraphs.append(_adf_para(*inline))
-
-            if paragraphs and (assignee_id or pm_id):
-                body = _adf_doc(*paragraphs)
-                if post_jira_comment(session, jira_url, api_version, key, body):
-                    commented.append(key)
-                else:
-                    print(f"   ⚠️  Comment failed for {key} (status gate: {status})")
+        # "New" status is console-only; commentable gates go into violations_map.
+        if gates.get("comment", True) and violations_map is not None:
+            for msg in msgs:
+                violations_map.setdefault(key, []).append(msg.strip())
 
     total_violations = sum(len(v) for v in violations_by_key.values())
     print(f"\n🚦 Status gate validation ({target_version} cohort):")
@@ -1742,17 +1653,6 @@ def validate_status_gates(
                 print(f"   ❌ {key} [{st}]: {len(msgs)} violation(s)")
                 for msg in msgs:
                     print(f"      • {msg.strip()[:100]}")
-    comment_eligible = sum(
-        1 for k, msgs in violations_by_key.items()
-        if _STATUS_GATES.get(
-            ((next((iss.get("fields") or {} for iss in features if iss.get("key") == k), None) or {})
-             .get("status") or {}).get("name", ""), {}
-        ).get("comment", True)
-    )
-    if do_comment and commented:
-        print(f"   💬 Status gate comments posted on {len(commented)} issue(s): {', '.join(commented)}")
-    elif not do_comment and comment_eligible:
-        print("   💡 Run with --apply to post Jira comments on ToDo/In Progress/In Review violations")
     new_count = sum(
         1 for k in violations_by_key
         if ((next((iss.get("fields") or {} for iss in features if iss.get("key") == k), None) or {})
@@ -1765,6 +1665,170 @@ def validate_status_gates(
         )
 
     return total_violations
+
+
+def post_validation_comments(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    violations_map: Dict[str, List[str]],
+    comment_hashes: Dict[str, str],
+    pm_field: str,
+    do_comment: bool,
+) -> Dict[str, str]:
+    """Post one consolidated Jira comment per feature covering all violations.
+
+    Uses hash-based deduplication: a comment is only posted when the set of
+    violation messages changes since the last successful post.  Returns the
+    updated comment_hashes dict.
+    """
+    updated = dict(comment_hashes)
+    feature_map = {iss.get("key"): iss for iss in features}
+    commented: List[str] = []
+    pending: List[str] = []
+
+    for key, messages in violations_map.items():
+        if not messages:
+            updated.pop(key, None)
+            continue
+        h = _violations_hash(messages)
+        if updated.get(key) == h:
+            continue
+        pending.append(key)
+        if not do_comment:
+            continue
+
+        issue = feature_map.get(key) or {}
+        fields = issue.get("fields") or {}
+        assignee = fields.get("assignee") or {}
+        pm = fields.get(pm_field) or {}
+        assignee_id = assignee.get("accountId", "")
+        assignee_name = assignee.get("displayName", "assignee")
+        pm_id = pm.get("accountId", "")
+        pm_name = pm.get("displayName", "product manager")
+
+        paragraphs: List[dict] = []
+        for i, msg in enumerate(messages):
+            inline: List[dict] = []
+            if i == 0:
+                if assignee_id:
+                    inline.append(_adf_mention(assignee_id, assignee_name))
+                if pm_id and pm_id != assignee_id:
+                    if inline:
+                        inline.append(_adf_text(" "))
+                    inline.append(_adf_mention(pm_id, pm_name))
+                elif not assignee_id and pm_id:
+                    inline.append(_adf_mention(pm_id, pm_name))
+            inline.append(_adf_text(f" {msg}" if i == 0 else msg))
+            paragraphs.append(_adf_para(*inline))
+
+        if not paragraphs or not (assignee_id or pm_id):
+            continue
+
+        body = _adf_doc(*paragraphs)
+        if post_jira_comment(session, jira_url, api_version, key, body):
+            updated[key] = h
+            commented.append(key)
+        else:
+            print(f"   ⚠️  Consolidated comment failed for {key}")
+
+    # Clear hashes for features that no longer have violations.
+    for k in list(updated.keys()):
+        if k not in violations_map or not violations_map[k]:
+            updated.pop(k, None)
+
+    print(f"\n💬 Validation comments:")
+    if do_comment and commented:
+        print(f"   ✅ Posted consolidated comment on {len(commented)} issue(s): {', '.join(commented)}")
+    elif do_comment and not pending:
+        print("   ✅ No new violations to notify (all previously commented or clean)")
+    elif do_comment and pending and not commented:
+        print(f"   ℹ️  {len(pending)} issue(s) have new violations but no contact found (no assignee/PM)")
+    elif not do_comment and pending:
+        print(f"   💡 {len(pending)} issue(s) have new/changed violations — run with --apply to post comments")
+    else:
+        print("   ✅ All clean")
+
+    return updated
+
+
+def label_project_aligned_features(
+    session: requests.Session,
+    jira_url: str,
+    api_version: str,
+    features: List[dict],
+    labels_by_key: Dict[str, List[str]],
+    do_apply: bool,
+) -> Tuple[int, int]:
+    """Add 'project::aligned' to features linked to a Project-type issue.
+
+    Scans each feature's issuelinks for any linked issue whose Jira type is in
+    PROJECT_ITEM_TYPES.  Returns (newly_labeled, already_labeled).
+    """
+    to_label: List[str] = []
+    already_labeled: List[str] = []
+
+    for issue in features:
+        key = (issue.get("key") or "").strip()
+        if not key:
+            continue
+        fields = issue.get("fields") or {}
+
+        is_aligned = False
+        for link in fields.get("issuelinks") or []:
+            for direction in ("outwardIssue", "inwardIssue"):
+                linked = link.get(direction) or {}
+                linked_type = (linked.get("fields") or {}).get("issuetype", {}).get("name", "")
+                if linked_type in PROJECT_ITEM_TYPES:
+                    is_aligned = True
+                    break
+            if is_aligned:
+                break
+
+        if not is_aligned:
+            continue
+
+        if PROJECT_ALIGNED_LABEL in (labels_by_key.get(key) or []):
+            already_labeled.append(key)
+        else:
+            to_label.append(key)
+
+    total = len(to_label) + len(already_labeled)
+    print(f"\n🔗 Project alignment ({PROJECT_ALIGNED_LABEL}):")
+    if total == 0:
+        print("   ℹ️  No features are linked to a Project item")
+        return 0, 0
+
+    if already_labeled:
+        print(f"   ✅ Already labeled ({len(already_labeled)}): {', '.join(already_labeled)}")
+
+    if not to_label:
+        print(f"   ✅ All project-aligned features already have '{PROJECT_ALIGNED_LABEL}'")
+        return 0, len(already_labeled)
+
+    print(f"   {'✅' if do_apply else '🔍'} To label ({len(to_label)}): {', '.join(to_label)}")
+
+    if not do_apply:
+        print(f"   💡 Run with --apply to add '{PROJECT_ALIGNED_LABEL}'")
+        return len(to_label), len(already_labeled)
+
+    labeled = 0
+    for key in to_label:
+        url = f"{jira_url.rstrip('/')}/rest/api/{api_version}/issue/{key}"
+        resp = session.put(
+            url,
+            json={"update": {"labels": [{"add": PROJECT_ALIGNED_LABEL}]}},
+            params={"notifyUsers": "false"},
+            timeout=30,
+        )
+        if resp.status_code in (200, 204):
+            labeled += 1
+        else:
+            print(f"   ⚠️  Label add failed for {key}: {resp.status_code}")
+
+    print(f"   🏷️  Added '{PROJECT_ALIGNED_LABEL}' to {labeled} feature(s)")
+    return labeled, len(already_labeled)
 
 
 def sync_rank_position_labels(
@@ -1814,6 +1878,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--issue-types",
+        default=os.getenv("JIRA_ISSUE_TYPES", "feature"),
+        help=(
+            "Comma-separated Jira issue types to include in the cohort "
+            "(default: feature). Example: feature,initiative"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Show planned rank order only (no Jira updates)",
@@ -1822,6 +1894,14 @@ def main() -> int:
         "--apply",
         action="store_true",
         help="Apply rank updates via Jira Rank API",
+    )
+    parser.add_argument(
+        "--no-comments",
+        action="store_true",
+        help=(
+            "Run validations and apply rank/field updates but suppress all Jira comment posts. "
+            "Useful for automated runs where comment noise should be avoided."
+        ),
     )
     parser.add_argument(
         "--state-file",
@@ -1912,6 +1992,9 @@ def main() -> int:
     if args.force_all and args.force_rank:
         print("⚠️  --force-all wins over --force-rank")
     do_apply = bool(args.apply) and not args.dry_run
+    do_comment = do_apply and not args.no_comments
+    if args.no_comments and do_apply:
+        print("ℹ️  --no-comments: Jira comment posts suppressed (rank and field updates still apply)")
     force_state = bool(args.force_rank) and not args.force_all
     force_all = bool(args.force_all)
 
@@ -1955,6 +2038,7 @@ def main() -> int:
         print(f"🔓 Cleared manual override for {k}")
 
     is_cloud = getattr(validator, "is_cloud", is_jira_cloud_url(validator.jira_url))
+    issue_types = [t.strip() for t in args.issue_types.split(",") if t.strip()] or ["feature"]
     plan_csv_keys: Optional[List[str]] = None
     if args.plan_csv:
         plan_path = args.plan_csv.expanduser()
@@ -1970,7 +2054,7 @@ def main() -> int:
     else:
         try:
             cohort_jql = build_cohort_jql(
-                validator.project_key, args.target_version, args.cohort
+                validator.project_key, args.target_version, args.cohort, issue_types
             )
         except ValueError as e:
             print(f"❌ {e}")
@@ -1981,6 +2065,7 @@ def main() -> int:
     reach_field = (rice_field_ids.get("reach") or "").strip()
     confidence_field = (rice_field_ids.get("confidence") or "").strip()
     reach_method_field = (rice_field_ids.get("reach_method") or "").strip()
+    effort_field = (rice_field_ids.get("effort") or "").strip()
     pm_field = os.getenv("JIRA_PRODUCT_MANAGER_FIELD", "customfield_10469")
     fields_param = f"labels,{rank_field},{rice_field},assignee,{pm_field},status"
     if not args.ignore_links:
@@ -1997,6 +2082,8 @@ def main() -> int:
         fields_param += f",{reach_method_field}"
     else:
         print("   ⚠️  Reach Method field not found — Proxy-Based confidence check disabled")
+    if effort_field:
+        fields_param += f",{effort_field}"
     try:
         features = fetch_cohort_features(
             validator.session,
@@ -2008,7 +2095,7 @@ def main() -> int:
     except Exception as e:
         print(f"❌ Error fetching cohort: {e}")
         return 1
-    print(f"📊 Found {len(features)} features in cohort")
+    print(f"📊 Found {len(features)} {'/'.join(issue_types)}(s) in cohort")
     if plan_csv_keys:
         plan_set = set(plan_csv_keys)
         features = [iss for iss in features if iss.get("key") in plan_set]
@@ -2020,6 +2107,7 @@ def main() -> int:
     reach_by_key: Dict[str, Optional[float]] = {}
     confidence_by_key: Dict[str, Optional[float]] = {}
     reach_method_by_key: Dict[str, Optional[str]] = {}
+    effort_by_key: Dict[str, Optional[float]] = {}
     status_by_key: Dict[str, Optional[str]] = {}
     lexo_by_key: Dict[str, str] = {}
     labels_by_key: Dict[str, List[str]] = {}
@@ -2034,6 +2122,8 @@ def main() -> int:
             confidence_by_key[key] = _parse_confidence_pct(fields.get(confidence_field))
         if reach_method_field:
             reach_method_by_key[key] = _parse_reach_method(fields.get(reach_method_field))
+        if effort_field:
+            effort_by_key[key] = _parse_rice_score(fields.get(effort_field))
         status_by_key[key] = (fields.get("status") or {}).get("name")
         lexo_by_key[key] = (fields.get(rank_field) or "").strip()
         labels_by_key[key] = list(fields.get("labels") or [])
@@ -2043,6 +2133,8 @@ def main() -> int:
         blocks_map = build_blocks_map(features, set(rice_by_key.keys()))
 
     api_ver = "3" if is_cloud else "2"
+    violations_map: Dict[str, List[str]] = {}
+    comment_hashes: Dict[str, str] = bucket.get("comment_hashes") or {}
     enforce_reach_labels(
         validator.session,
         validator.jira_url,
@@ -2053,11 +2145,8 @@ def main() -> int:
         reach_field,
         do_apply,
         pm_field,
+        violations_map=violations_map,
     )
-    # Load previously-notified discovery features (bool markers).
-    # Entries are cleared when a feature's confidence changes away from 50%.
-    _raw_notified = bucket.get("discovery_notified") or {}
-    discovery_notified: Dict[str, bool] = {k: bool(v) for k, v in _raw_notified.items()}
     validate_data_quality(
         validator.session,
         validator.jira_url,
@@ -2066,20 +2155,11 @@ def main() -> int:
         rice_by_key,
         labels_by_key,
         args.target_version,
-        do_comment=do_apply,
         confidence_by_key=confidence_by_key if confidence_field else None,
         reach_method_by_key=reach_method_by_key if reach_method_field else None,
-        discovery_notified=discovery_notified,
+        effort_by_key=effort_by_key if effort_field else None,
+        violations_map=violations_map,
     )
-    # Persist: keep only features that are still in the cohort and still at 50% confidence.
-    cohort_keys = set(rice_by_key.keys())
-    bucket["discovery_notified"] = {
-        k: True for k, v in discovery_notified.items()
-        if v
-        and k in cohort_keys
-        and confidence_by_key.get(k) is not None
-        and abs((confidence_by_key.get(k) or 0.0) - 0.5) < 0.01
-    }
     validate_status_gates(
         validator.session,
         validator.jira_url,
@@ -2087,9 +2167,29 @@ def main() -> int:
         features,
         rice_by_key,
         args.target_version,
-        do_comment=do_apply,
         pm_field=pm_field,
+        violations_map=violations_map,
     )
+    comment_hashes = post_validation_comments(
+        validator.session,
+        validator.jira_url,
+        api_ver,
+        features,
+        violations_map,
+        comment_hashes,
+        pm_field,
+        do_comment,
+    )
+    bucket["comment_hashes"] = comment_hashes
+    if not args.ignore_links:
+        label_project_aligned_features(
+            validator.session,
+            validator.jira_url,
+            api_ver,
+            features,
+            labels_by_key,
+            do_apply,
+        )
     auto_progress_features(
         validator.session,
         validator.jira_url,
@@ -2342,7 +2442,9 @@ def main() -> int:
         return 1
     print(f"   ✅ {msg}")
 
-    if locked_rank_before:
+    if locked_rank_before and not force_state:
+        # Skip absolute-position check when --force-rank is active: re-ranking state-locked
+        # features shifts every anchor's row index without the anchor itself being moved.
         rank_order_after = _search_jql_all_keys(
             validator.session,
             validator.jira_url,
@@ -2362,6 +2464,11 @@ def main() -> int:
             )
             return 1
         print(f"   ✅ {len(locked_rank_before)} manual anchor(s) unchanged at same row #")
+    elif locked_rank_before and force_state:
+        print(
+            f"   ✅ {len(locked_rank_before)} manual anchor(s) position not verified"
+            f" (--force-rank re-ranks surrounding features; anchor row # may shift)"
+        )
 
     # Refresh ranks after moves
     refreshed = refresh_issue_fields(validator, list(rice_by_key.keys()), fields_param)
